@@ -1,0 +1,153 @@
+// Constants & Globals
+LED_PIN ← 13
+RX_BUFFER_SIZE ← 24
+FIRST_TIME ← true
+rxBuffer ← {0}
+rxBufferIndex ← 0
+packet ← {0}
+posX ← 0.0
+posY ← 0.0
+accumTheta ← 0.0
+lastUpdateMicros ← 0
+desired_data ← {0}
+number ← 0.0
+bits ← 0
+
+// ROS Entities
+allocator, support, node, executor
+publisher, pub_msg
+subscription, sub_msg
+
+// Helper: infinite error loop
+function error_loop():
+    loop forever:
+        delay(100 ms)
+
+// Helper: wrap angle into [−π, π]
+function wrapTheta(theta):
+    theta ← mod(theta + π, 2·π)
+    if theta < 0 then
+        theta ← theta + 2·π
+    return theta − π
+
+// Subscription callback for incoming desired_theta
+function subscription_callback(msg):
+    if msg.data.size ≠ 8:
+        return
+    copy msg.data → desired_data // Extract desired theta and distance
+    
+    // Build 12‐byte packet: [AA][8 payload][xor][EE][EF]
+    packet ← 0xAA
+    for i in 0..7:
+        packet[i+1] ← desired_data[i]
+    xorVal ← packet
+    for i in 1..8:
+        xorVal ← xorVal XOR packet[i]
+    packet ← xorVal
+    packet ← 0xEE
+    packet ← 0xEF
+    Serial2.write(packet, length=12) // Send to Arduino Mega
+
+// Arduino setup() function
+function setup():
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH)
+    Serial.begin(115200) // For debugging/monitor
+    Serial2.begin(115200, pins=16,17) // For communication with Arduino Mega
+    delay(2000) // Allow time for serial to initialize
+    
+    set_microros_transports() // Configure micro-ROS serial transport
+    allocator ← rcl_get_default_allocator()
+    support ← rclc_support_init(allocator)
+    node ← rclc_node_init("esp32_node", support)
+    
+    // Publisher for /current_pose
+    publisher ← rclc_publisher_init(node, UInt8MultiArray, "/current_pose")
+    init pub_msg with rxBuffer (capacity RX_BUFFER_SIZE)
+    
+    // Subscription for /desired_theta
+    subscription ← rclc_subscription_init(node, UInt8MultiArray, "/desired_theta")
+    allocate sub_msg for 8 bytes
+    
+    executor ← rclc_executor_init(support, 1)
+    rclc_executor_add_subscription(executor, subscription, sub_msg, subscription_callback)
+    
+    lastUpdateMicros ← micros() // Initialize timestamp for odometry
+
+// Arduino loop() function
+function loop():
+    // 1. Read from Serial2 into rxBuffer (from Arduino Mega)
+    while Serial2.available() > 0 and rxBufferIndex < RX_BUFFER_SIZE:
+        rxBuffer ← Serial2.read()
+    
+    // 2. Parse complete 8‐byte frames
+    i ← 0
+    while i ≤ rxBufferIndex − 8:
+        if rxBuffer[i]==0xAA and rxBuffer[i+6]==0xEE and rxBuffer[i+7]==0xEF:
+            calcXor ← XOR of rxBuffer[i..i+4]
+            if calcXor == rxBuffer[i+5]: // Check checksum
+                // Extract and convert wheel speeds
+                rawL ← combine_bytes(rxBuffer[i+1], rxBuffer[i+2]) // int16 left velocity
+                rawR ← combine_bytes(rxBuffer[i+3], rxBuffer[i+4]) // int16 right velocity
+                
+                conv ← π*0.165/120 // Conversion factor from RPM to m/s (wheel radius 0.165m, 120 for RPM to rps and then to m/s)
+                vL ← rawL*conv;
+                vR ← rawR*conv
+                
+                // Time & odometry calculation
+                now ← micros()
+                dt ← (now − lastUpdateMicros)/1e6 // Time difference in seconds
+                lastUpdateMicros ← now
+                
+                omega ← (vR−vL)/0.441 // Angular velocity (0.441m is track width)
+                accumTheta ← accumTheta + omega*dt // Integrate angular velocity
+                accumTheta ← wrapTheta(accumTheta) // Keep theta within [−π, π]
+                
+                dist ← ((vL+vR)/2)*dt // Linear distance traveled
+                posX ← posX + dist*cos(accumTheta) // Update X position
+                posY ← posY + dist*sin(accumTheta) // Update Y position
+                
+                // Build & publish pose packet (16 bytes) on /current_pose
+                out ← 0xAA
+                write_float_bytes(posX) → out[1..4]
+                write_float_bytes(posY) → out[5..8]
+                write_float_bytes(accumTheta) → out[9..12]
+                xorOut ← XOR of out[0..12]
+                out ← xorOut;
+                out ← 0xEE;
+                out ← 0xEF
+                
+                copy out → pub_msg.data // Copy constructed packet to ROS message
+                pub_msg.data.size ← 16
+                rcl_publish(publisher, pub_msg) // Publish pose
+                
+                i ← i + 8 // Move to next potential packet
+                continue
+        i ← i + 1 // Move to next byte if current byte is not a header
+    
+    // 3. Shift leftovers in rxBuffer
+    if i < rxBufferIndex:
+        move rxBuffer[i..] → rxBuffer
+        rxBufferIndex ← rxBufferIndex − i
+    else:
+        rxBufferIndex ← 0
+    
+    // 4. Handle ROS callbacks
+    rclc_executor_spin_some(executor, 10 ms) // Process pending ROS messages
+    
+    // 5. Heartbeat / Debugging (every 5s or on first cycle)
+    if millis() − (lastUpdateMicros/1000) > 5000 or FIRST_TIME:
+        FIRST_TIME ← false
+        lastUpdateMicros ← micros() // Update timestamp for heartbeat
+        
+        bits ← bit_copy(number as float) // Example: publish a changing float
+        rxBuffer ← 0xAA
+        write_uint32_be(bits) → rxBuffer[1..4]
+        zero_fill(rxBuffer[5..12])
+        rxBuffer ← XOR of rxBuffer[0..4]
+        rxBuffer ← 0xEE;
+        rxBuffer ← 0xEF
+        pub_msg.data.size ← 16
+        rcl_publish(publisher, pub_msg)
+        rxBufferIndex ← 0
+        number ← number + 1
